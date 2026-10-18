@@ -6297,6 +6297,7 @@ body.admin-panel-open .admin-launcher-bar {
           title: r.title,
           driveUrl: r.driveUrl,
           fileName: r.fileName,
+          storagePath: r.storagePath || '',
           extracted: r.extracted
         }))
       })),
@@ -6315,15 +6316,18 @@ body.admin-panel-open .admin-launcher-bar {
     try {
       localStorage.setItem(ADMIN_STORAGE_KEY, JSON.stringify(snapshot));
     } catch {}
+    let cloudSave = Promise.resolve(true);
     if (window.vishHubAdminAuthorized && typeof window.vishHubSaveCloudSnapshot === 'function') {
-      window.vishHubSaveCloudSnapshot(snapshot).catch(error => {
+      cloudSave = window.vishHubSaveCloudSnapshot(snapshot).then(() => true).catch(error => {
         console.error('Could not publish Admin changes to Firebase.', error);
         showAdminBanner('Saved on this device, but Firebase sync failed. Check Firestore setup and security rules.');
+        return false;
       });
     }
     refreshStudentAppViews();
     updateSidebarBadges();
     if (bannerMsg) showAdminBanner(bannerMsg);
+    return cloudSave;
   };
 
   window.addEventListener('vishhub-cloud-snapshot', event => {
@@ -6494,6 +6498,15 @@ body.admin-panel-open .admin-launcher-bar {
       routeBeforeAdmin = location.pathname + location.search + location.hash;
       try { history.pushState({ vishHubAdminRoute: true }, '', '/vishadmin'); } catch {}
     }
+    if (!window.vishHubAdminAuthorized) {
+      const panel = document.getElementById('adminPanelPage');
+      const gate = document.getElementById('adminAuthGate');
+      if (panel) panel.hidden = true;
+      if (gate) gate.hidden = false;
+      return;
+    }
+    const gate = document.getElementById('adminAuthGate');
+    if (gate) gate.hidden = true;
     applySavedAdminSnapshot();
     const page = document.getElementById('adminPanelPage');
     page.hidden = false;
@@ -6750,9 +6763,11 @@ body.admin-panel-open .admin-launcher-bar {
           }
           const sub = b.subjects.find(s => s.id === subId);
           if (sub && sub.resources) {
-            sub.resources.splice(Number(idx), 1);
+            const [removedResource] = sub.resources.splice(Number(idx), 1);
             pendingDeleteKey = null;
-            saveAdminSnapshot('Study resource removed.');
+            saveAdminSnapshot('Study resource removed.').then(synced => {
+              if (synced && removedResource?.storagePath) window.vishHubDeleteStoredFile?.(removedResource.storagePath).catch(error => console.warn('Resource file could not be removed from Storage.', error));
+            });
             renderCurrentAdminTab();
           }
         };
@@ -7223,16 +7238,30 @@ body.admin-panel-open .admin-launcher-bar {
     document.getElementById('adminModalTitle').textContent = title;
     const form = document.getElementById('adminModalForm');
     form.innerHTML = formHtml + `
+      <p id="adminModalFeedback" role="status" aria-live="polite" hidden style="margin:4px 0;padding:10px 12px;border-radius:10px;background:#f2f5f8;color:#40516a;font-size:12px"></p>
       <div class="admin-modal-actions">
         <button type="button" class="admin-btn outline" id="cancelAdminModalBtn">Cancel</button>
         <button type="submit" class="admin-btn gold">Save &amp; Publish</button>
       </div>
     `;
     form.querySelector('#cancelAdminModalBtn').onclick = closeModal;
-    form.onsubmit = (e) => {
+    form.onsubmit = async (e) => {
       e.preventDefault();
-      onSubmit(new FormData(form));
-      closeModal();
+      const submitButton = form.querySelector('button[type="submit"]');
+      const cancelButton = form.querySelector('#cancelAdminModalBtn');
+      const feedback = form.querySelector('#adminModalFeedback');
+      const reportProgress = (message) => { if (feedback) { feedback.textContent = message; feedback.hidden = false; } };
+      submitButton.disabled = true;
+      cancelButton.disabled = true;
+      try {
+        await onSubmit(new FormData(form), reportProgress);
+        closeModal();
+      } catch (error) {
+        reportProgress(error?.message || 'Could not save this resource. Check Firebase setup and try again.');
+      } finally {
+        submitButton.disabled = false;
+        cancelButton.disabled = false;
+      }
     };
     scrim.hidden = false;
   };
@@ -7282,26 +7311,55 @@ body.admin-panel-open .admin-launcher-bar {
         </select>
       </label>
       <label class="admin-field">Resource Title<input name="title" value="${escHtml(existing?.title || '')}" required placeholder="e.g. Economics Major 1 Study Notes"></label>
-      <label class="admin-field">Google Drive or PDF URL<input name="driveUrl" value="${escHtml(existing?.driveUrl || '')}" required placeholder="https://drive.google.com/file/d/.../view"></label>
-      <label class="admin-field">File Name<input name="fileName" value="${escHtml(existing?.fileName || 'Study_Resource.pdf')}" required></label>
-    `, (fd) => {
+      <label class="admin-field">Choose a PDF to upload (optional)<input name="resourceFile" type="file" accept="application/pdf,.pdf"></label>
+      <label class="admin-field">Or paste a Google Drive / PDF URL<input name="driveUrl" value="${escHtml(existing?.driveUrl || '')}" placeholder="https://drive.google.com/file/d/.../view"></label>
+      <label class="admin-field">File Name<input name="fileName" value="${escHtml(existing?.fileName || 'Study_Resource.pdf')}"></label>
+      <small style="color:#66758a;font-size:11px">PDF uploads up to 20 MB are shared through Firebase Storage.</small>
+    `, async (fd, reportProgress) => {
       const targetSubId = String(fd.get('subjectId'));
       const targetSub = b.subjects.find(s => s.id === targetSubId);
       if (!targetSub) return;
+      const selectedFile = fd.get('resourceFile');
+      const file = selectedFile instanceof File && selectedFile.size ? selectedFile : null;
+      const urlInput = String(fd.get('driveUrl') || '').trim();
+      if (!file && !urlInput && !existing?.driveUrl) throw new Error('Choose a PDF or paste a Google Drive/PDF URL.');
+      if (file && file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) throw new Error('Please select a PDF file.');
+      if (file && file.size > 20 * 1024 * 1024) throw new Error('The PDF must be 20 MB or smaller.');
+      let uploaded = null;
+      if (file) {
+        if (typeof window.vishHubUploadAdminFile !== 'function') throw new Error('Firebase Storage is not ready. Open the deployed HTTPS site and try again.');
+        reportProgress('Uploading PDF… 0%');
+        uploaded = await window.vishHubUploadAdminFile(file, progress => reportProgress(`Uploading PDF… ${progress}%`));
+      }
       targetSub.resources = targetSub.resources || [];
       const item = {
         type: String(fd.get('type')),
         title: String(fd.get('title')).trim(),
-        driveUrl: normalizeDriveUrl(fd.get('driveUrl')),
-        fileName: String(fd.get('fileName')).trim() || 'Study_Resource.pdf'
+        driveUrl: uploaded?.url || (urlInput ? normalizeDriveUrl(urlInput) : existing?.driveUrl || ''),
+        fileName: String(fd.get('fileName') || '').trim() || file?.name || existing?.fileName || 'Study_Resource.pdf',
+        storagePath: uploaded?.path || existing?.storagePath || ''
       };
+      const previousSnapshot = localStorage.getItem(ADMIN_STORAGE_KEY);
       if (existing && targetSubId === subjectId) {
         targetSub.resources[index] = item;
       } else {
         if (existing && sub?.resources) sub.resources.splice(index, 1);
         targetSub.resources.push(item);
       }
-      saveAdminSnapshot(existing ? 'Study resource updated.' : 'Study resource added.');
+      const synced = await saveAdminSnapshot(existing ? 'Study resource updated.' : 'Study resource added.');
+      if (!synced) {
+        if (existing && targetSubId === subjectId) targetSub.resources[index] = existing;
+        else if (existing && sub?.resources) { targetSub.resources.splice(targetSub.resources.indexOf(item), 1); sub.resources.splice(index, 0, existing); }
+        else targetSub.resources.splice(targetSub.resources.indexOf(item), 1);
+        try { if (previousSnapshot) localStorage.setItem(ADMIN_STORAGE_KEY, previousSnapshot); else localStorage.removeItem(ADMIN_STORAGE_KEY); } catch {}
+        refreshStudentAppViews();
+        renderCurrentAdminTab();
+        if (uploaded) await window.vishHubDeleteStoredFile?.(uploaded.path).catch(() => {});
+        throw new Error('The PDF uploaded, but its shared catalog entry could not be saved. Check Firestore rules and retry.');
+      }
+      if (existing?.storagePath && existing.storagePath !== item.storagePath) {
+        window.vishHubDeleteStoredFile?.(existing.storagePath).catch(error => console.warn('Old resource file could not be removed from Storage.', error));
+      }
       renderCurrentAdminTab();
     });
   };
@@ -7598,8 +7656,9 @@ body.admin-panel-open .admin-launcher-bar {
   import { getAnalytics, isSupported as isAnalyticsSupported } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-analytics.js';
   import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
   import { getFirestore, doc, setDoc, getDoc, onSnapshot, serverTimestamp } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js';
+  import { getStorage, ref as storageRef, uploadBytesResumable, getDownloadURL, deleteObject } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-storage.js';
   const firebaseConfig={apiKey:'AIzaSyCOYOY7bxb7Xj1wXR7t5mo4HWP6dh6ytrM',authDomain:'vish-hub.firebaseapp.com',projectId:'vish-hub',storageBucket:'vish-hub.firebasestorage.app',messagingSenderId:'287693072826',appId:'1:287693072826:web:4870d52e1eb074c1395583',measurementId:'G-E23PGJCKZT'};
-  const ADMIN_EMAIL='shrivishaljadhav@gmail.com'; const app=initializeApp(firebaseConfig); const auth=getAuth(app); const db=getFirestore(app); const sharedAdminDoc=doc(db,'vishHub','adminState');
+  const ADMIN_EMAIL='shrivishaljadhav@gmail.com'; const app=initializeApp(firebaseConfig); const auth=getAuth(app); const db=getFirestore(app); const storage=getStorage(app); const sharedAdminDoc=doc(db,'vishHub','adminState');
   window.vishHubFirebaseApp=app; window.vishHubFirebaseAuth=auth; window.vishHubAdminAuthorized=false;
   window.vishHubSaveCloudSnapshot=async(snapshot)=>{
     if(!window.vishHubAdminAuthorized||auth.currentUser?.email?.toLowerCase()!==ADMIN_EMAIL)throw new Error('Admin sign-in is required to publish shared content.');
@@ -7614,13 +7673,34 @@ body.admin-panel-open .admin-launcher-bar {
     try{const remote=await getDoc(sharedAdminDoc);if(!remote.exists())window.dispatchEvent(new Event('vishhub-cloud-empty'));}
     catch(error){console.error('Could not check shared Admin content in Firestore.',error);}
   };
+  window.vishHubUploadAdminFile=async(file,onProgress=()=>{})=>{
+    if(!window.vishHubAdminAuthorized||auth.currentUser?.email?.toLowerCase()!==ADMIN_EMAIL)throw new Error('Sign in with the admin account before uploading.');
+    if(file.type!=='application/pdf'&&!file.name.toLowerCase().endsWith('.pdf'))throw new Error('Only PDF files are supported.');
+    if(file.size>20*1024*1024)throw new Error('The PDF must be 20 MB or smaller.');
+    const cleanName=file.name.replace(/[^a-zA-Z0-9._-]+/g,'_');
+    const randomId=globalThis.crypto?.randomUUID?.()||Math.random().toString(36).slice(2);
+    const path=`admin-resources/${Date.now()}-${randomId}-${cleanName}`;
+    const task=uploadBytesResumable(storageRef(storage,path),file,{contentType:'application/pdf'});
+    await new Promise((resolve,reject)=>task.on('state_changed',snapshot=>onProgress(Math.round(snapshot.bytesTransferred/snapshot.totalBytes*100)),reject,resolve));
+    const url=await getDownloadURL(task.snapshot.ref);
+    return {url,path};
+  };
+  window.vishHubDeleteStoredFile=async(path)=>{
+    if(!window.vishHubAdminAuthorized||auth.currentUser?.email?.toLowerCase()!==ADMIN_EMAIL)throw new Error('Admin sign-in is required.');
+    if(path)await deleteObject(storageRef(storage,path));
+  };
   try{if(await isAnalyticsSupported()){window.vishHubAnalytics=getAnalytics(app);document.documentElement.dataset.firebaseAnalytics='ready'}}catch(error){console.warn('Firebase Analytics is unavailable in this browser.',error);document.documentElement.dataset.firebaseAnalytics='unavailable'}
   const adminPath=()=>location.pathname.replace(/\/+$/,'')==='/vishadmin'; const gate=document.getElementById('adminAuthGate'); const panel=document.getElementById('adminPanelPage'); const form=document.getElementById('adminAuthForm'); const status=document.getElementById('adminAuthStatus'); const setStatus=(message)=>{if(status)status.textContent=message};
   const authorize=async(user)=>{
     if(!user||user.email?.toLowerCase()!==ADMIN_EMAIL){window.vishHubAdminAuthorized=false;if(panel)panel.hidden=true;if(gate&&adminPath())gate.hidden=false;setStatus('This Firebase account is not authorized for admin access.');if(user)await signOut(auth);return}
     window.vishHubAdminAuthorized=true;if(gate)gate.hidden=true;setStatus('');window.vishHubEnsureCloudSnapshot?.();window.dispatchEvent(new Event('vishhub-admin-authorized'))
   };
-  if(adminPath()){if(panel)panel.hidden=true;if(gate)gate.hidden=false;form?.addEventListener('submit',async(event)=>{event.preventDefault();const submit=document.getElementById('adminAuthSubmit');if(submit)submit.disabled=true;setStatus('Signing in…');try{const email=document.getElementById('adminAuthEmail')?.value?.trim().toLowerCase()||'';const password=document.getElementById('adminAuthPassword')?.value||'';if(email!==ADMIN_EMAIL)throw new Error('Use the authorized admin email address.');const credential=await signInWithEmailAndPassword(auth,email,password);await authorize(credential.user);if(window.vishHubAdminAuthorized)form.reset()}catch(error){setStatus(error?.code==='auth/invalid-credential'||error?.code==='auth/wrong-password'?'Email or password is incorrect.':error?.message||'Sign-in failed. Please try again.')}finally{if(submit)submit.disabled=false}});onAuthStateChanged(auth,(user)=>{if(user)authorize(user);else{window.vishHubAdminAuthorized=false;if(panel)panel.hidden=true;if(gate)gate.hidden=false}});document.getElementById('adminSignOutBtn')?.addEventListener('click',()=>signOut(auth))}
+  if(panel)panel.hidden=true;
+  if(gate)gate.hidden=!adminPath();
+  form?.addEventListener('submit',async(event)=>{event.preventDefault();const submit=document.getElementById('adminAuthSubmit');if(submit)submit.disabled=true;setStatus('Signing in…');try{const email=document.getElementById('adminAuthEmail')?.value?.trim().toLowerCase()||'';const password=document.getElementById('adminAuthPassword')?.value||'';if(email!==ADMIN_EMAIL)throw new Error('Use the authorized admin email address.');const credential=await signInWithEmailAndPassword(auth,email,password);await authorize(credential.user);if(window.vishHubAdminAuthorized)form.reset()}catch(error){setStatus(error?.code==='auth/invalid-credential'||error?.code==='auth/wrong-password'?'Email or password is incorrect.':error?.message||'Sign-in failed. Please try again.')}finally{if(submit)submit.disabled=false}});
+  onAuthStateChanged(auth,(user)=>{if(user)authorize(user);else{window.vishHubAdminAuthorized=false;if(panel)panel.hidden=true;if(gate)gate.hidden=!adminPath()}});
+  document.getElementById('adminSignOutBtn')?.addEventListener('click',()=>signOut(auth));
+  window.addEventListener('popstate',()=>{if(adminPath()){if(window.vishHubAdminAuthorized)window.dispatchEvent(new Event('vishhub-admin-authorized'));else if(gate)gate.hidden=false}else{if(gate)gate.hidden=true;if(panel)panel.hidden=true}});
 </script>
 </body>
 </html>

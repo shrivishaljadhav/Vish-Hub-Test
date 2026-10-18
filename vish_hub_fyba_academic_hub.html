@@ -6460,7 +6460,6 @@ body.admin-panel-open .admin-launcher-bar {
 
   const switchAdminTab = (tab) => {
     currentTab = sectionConfig[tab] ? tab : 'overview';
-    window.vishHubAnalytics?.track('admin_module_view', { module_name: currentTab });
     pendingDeleteKey = null;
     document.querySelectorAll('#adminNavTabs [data-admin-tab]').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.adminTab === currentTab);
@@ -6482,7 +6481,6 @@ body.admin-panel-open .admin-launcher-bar {
       try { history.pushState({ vishHubAdminRoute: true }, '', '/admin'); } catch {}
     }
     applySavedAdminSnapshot();
-    window.vishHubAnalytics?.track('admin_panel_view');
     const page = document.getElementById('adminPanelPage');
     page.hidden = false;
     document.body.classList.add('admin-panel-open');
@@ -7582,34 +7580,5 @@ body.admin-panel-open .admin-launcher-bar {
 })();
 </script>
 
-<script type="module" id="firebase-analytics-init">
-  import { initializeApp } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js';
-  import { getAnalytics, isSupported, logEvent } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-analytics.js';
-
-  const firebaseConfig = {
-    apiKey: 'AIzaSyCOYO7Ybxb7Xj1wXR7t5mo4HWP6dh6ytrM',
-    authDomain: 'vish-hub.firebaseapp.com',
-    projectId: 'vish-hub',
-    storageBucket: 'vish-hub.firebasestorage.app',
-    messagingSenderId: '287693072826',
-    appId: '1:287693072826:web:4870d52e1eb074c1395583',
-    measurementId: 'G-E23PGJCKZT'
-  };
-
-  try {
-    const app = initializeApp(firebaseConfig);
-    if (await isSupported()) {
-      const analytics = getAnalytics(app);
-      window.vishHubAnalytics = {
-        track: (eventName, parameters = {}) => logEvent(analytics, eventName, parameters)
-      };
-      if (location.pathname.replace(/\/+$/, '') === '/admin') {
-        window.vishHubAnalytics.track('admin_panel_view');
-      }
-    }
-  } catch (error) {
-    console.warn('Firebase Analytics could not be initialized in this browser.', error);
-  }
-</script>
 </body>
 </html>

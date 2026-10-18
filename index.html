@@ -5449,6 +5449,8 @@ body.profile-photo-crop-open{overflow:hidden!important}
 </style>
 
 <!-- Admin panel is available at /vishadmin. -->
+<style id="firebase-admin-gate-style">.admin-auth-gate{position:fixed;z-index:120;inset:0;display:grid;place-items:center;padding:22px;background:radial-gradient(ellipse at 50% 0%,#d4af3724,transparent 48%),linear-gradient(145deg,#0d2141,#193a65 55%,#10294b);color:#172f52}.admin-auth-gate[hidden]{display:none!important}.admin-auth-card{width:min(100%,420px);padding:28px;border:1px solid #d5b85c;border-radius:22px;background:linear-gradient(145deg,#fff,#f6f4ec);box-shadow:0 25px 75px #0006}.admin-auth-brand{color:#a38232;font-size:10px;font-weight:700;letter-spacing:.2em}.admin-auth-card h1{margin:8px 0;color:#142e52;font:600 27px Georgia,serif}.admin-auth-card p{color:#68778c;font-size:12px;line-height:1.55}.admin-auth-card label{display:grid;gap:6px;margin:14px 0;color:#243d5a;font-size:11px;font-weight:650}.admin-auth-card input{height:44px;padding:0 12px;border:1px solid #d9d1bd;border-radius:10px;background:white;color:#10294b;font:14px Arial,sans-serif}.admin-auth-card button{width:100%;height:44px;margin-top:8px;border:1px solid #f0d98f;border-radius:999px;background:linear-gradient(115deg,#f4e2a7,#c6a348);color:#10294b;font-weight:700;cursor:pointer}.admin-auth-status{min-height:18px;margin:12px 0 0!important;color:#8a3c35!important;font-size:11px!important}.admin-auth-status:empty{display:none}</style>
+<section class="admin-auth-gate" id="adminAuthGate" hidden aria-labelledby="adminAuthTitle"><div class="admin-auth-card"><span class="admin-auth-brand">VISH HUB · ADMIN ACCESS</span><h1 id="adminAuthTitle">Admin sign in</h1><p>Sign in with the authorized Firebase account to continue.</p><form id="adminAuthForm"><label>Email address<input id="adminAuthEmail" type="email" value="shrivishaljadhav@gmail.com" autocomplete="username" readonly></label><label>Password<input id="adminAuthPassword" type="password" autocomplete="current-password" required></label><button id="adminAuthSubmit" type="submit">Continue to Admin Panel</button><p class="admin-auth-status" id="adminAuthStatus" role="status" aria-live="polite"></p></form></div></section>
 <section class="admin-panel-page" id="adminPanelPage" role="dialog" aria-modal="true" aria-labelledby="adminPanelTitle" hidden>
   <div class="admin-shell">
     <!-- Sidebar / Top Navigation -->
@@ -5531,6 +5533,7 @@ body.profile-photo-crop-open{overflow:hidden!important}
           </label>
           <button type="button" class="admin-btn gold" id="adminPrimaryActionBtn">+ Quick Add</button>
           <button type="button" class="admin-btn outline" id="adminPreviewHubBtn">Preview Student App</button>
+          <button type="button" class="admin-btn outline" id="adminSignOutBtn">Sign out</button>
         </div>
       </header>
 
@@ -6274,12 +6277,12 @@ body.admin-panel-open .admin-launcher-bar {
     });
   };
 
-  // Save & Load full Admin Overrides to localStorage
-  const saveAdminSnapshot = (bannerMsg = '') => {
+  // Build the shared Admin state; keep a local copy for quick/offline access.
+  const buildAdminSnapshot = () => {
     const b = getBridge();
-    if (!b) return;
+    if (!b) return null;
     const nb = getNoticesBridge();
-    const snapshot = {
+    return {
       updatedAt: new Date().toISOString(),
       subjects: b.subjects.map(s => ({
         id: s.id,
@@ -6303,13 +6306,40 @@ body.admin-panel-open .admin-launcher-bar {
       notices: nb?.notices || [],
       notifications: getNotificationItems()
     };
+  };
+  window.vishHubGetAdminSnapshot = buildAdminSnapshot;
+
+  const saveAdminSnapshot = (bannerMsg = '') => {
+    const snapshot = buildAdminSnapshot();
+    if (!snapshot) return;
     try {
       localStorage.setItem(ADMIN_STORAGE_KEY, JSON.stringify(snapshot));
     } catch {}
+    if (window.vishHubAdminAuthorized && typeof window.vishHubSaveCloudSnapshot === 'function') {
+      window.vishHubSaveCloudSnapshot(snapshot).catch(error => {
+        console.error('Could not publish Admin changes to Firebase.', error);
+        showAdminBanner('Saved on this device, but Firebase sync failed. Check Firestore setup and security rules.');
+      });
+    }
     refreshStudentAppViews();
     updateSidebarBadges();
     if (bannerMsg) showAdminBanner(bannerMsg);
   };
+
+  window.addEventListener('vishhub-cloud-snapshot', event => {
+    const snapshot = event.detail;
+    if (!snapshot || typeof snapshot !== 'object') return;
+    try { localStorage.setItem(ADMIN_STORAGE_KEY, JSON.stringify(snapshot)); } catch {}
+    applySavedAdminSnapshot();
+    if (!document.getElementById('adminPanelPage')?.hidden) renderCurrentAdminTab();
+  });
+  window.addEventListener('vishhub-cloud-empty', () => {
+    if (!window.vishHubAdminAuthorized) return;
+    const snapshot = buildAdminSnapshot();
+    if (snapshot && typeof window.vishHubSaveCloudSnapshot === 'function') {
+      window.vishHubSaveCloudSnapshot(snapshot).catch(error => console.error('Could not initialize shared Admin data in Firebase.', error));
+    }
+  });
 
   const applySavedAdminSnapshot = () => {
     const b = getBridge();
@@ -7146,7 +7176,7 @@ body.admin-panel-open .admin-launcher-bar {
               <button type="button" class="admin-btn small danger" id="resetFactoryBtn">${pendingDeleteKey === 'factory-reset' ? 'Confirm Factory Reset?' : 'Reset to Factory Defaults'}</button>
             </div>
           </div>
-          <p style="margin:0;color:#5b6b82;font-size:12px">All changes made in the Admin Panel are persisted in browser storage (<code>vishHubAdminStateV1</code>) and immediately reflected across the Student Hub.</p>
+          <p style="margin:0;color:#5b6b82;font-size:12px">Admin changes are saved on this device and, when signed in, synced through Firebase so they appear for other users.</p>
         </section>
       `;
 
@@ -7160,6 +7190,9 @@ body.admin-panel-open .admin-launcher-bar {
             const parsed = JSON.parse(String(reader.result || '{}'));
             localStorage.setItem(ADMIN_STORAGE_KEY, JSON.stringify(parsed));
             applySavedAdminSnapshot();
+            if (window.vishHubAdminAuthorized && typeof window.vishHubSaveCloudSnapshot === 'function') {
+              window.vishHubSaveCloudSnapshot(parsed).catch(error => showAdminBanner('Imported on this device, but Firebase sync failed. Check Firestore setup and rules.'));
+            }
             showAdminBanner('Backup imported and applied to live portal.');
             renderCurrentAdminTab();
           } catch {
@@ -7541,9 +7574,10 @@ body.admin-panel-open .admin-launcher-bar {
       if (e.target.id === 'adminModalScrim') closeModal();
     });
     document.getElementById('adminGlobalSearch')?.addEventListener('input', () => renderCurrentAdminTab());
-    if (isAdminRoute()) openAdminPanel('overview', true);
+    if (isAdminRoute() && window.vishHubAdminAuthorized) openAdminPanel('overview', true);
+    window.addEventListener('vishhub-admin-authorized', () => { if (isAdminRoute()) openAdminPanel('overview', true); });
     window.addEventListener('popstate', () => {
-      if (isAdminRoute()) openAdminPanel('overview', true);
+      if (isAdminRoute() && window.vishHubAdminAuthorized) openAdminPanel('overview', true);
       else if (!document.getElementById('adminPanelPage')?.hidden) closeAdminPanel();
     });
 
@@ -7562,29 +7596,31 @@ body.admin-panel-open .admin-launcher-bar {
 <script id="vishhub-firebase-bootstrap" type="module">
   import { initializeApp } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js';
   import { getAnalytics, isSupported as isAnalyticsSupported } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-analytics.js';
-
-  const firebaseConfig = {
-    apiKey: 'AIzaSyCOYOY7bxb7Xj1wXR7t5mo4HWP6dh6ytrM',
-    authDomain: 'vish-hub.firebaseapp.com',
-    projectId: 'vish-hub',
-    storageBucket: 'vish-hub.firebasestorage.app',
-    messagingSenderId: '287693072826',
-    appId: '1:287693072826:web:4870d52e1eb074c1395583',
-    measurementId: 'G-E23PGJCKZT'
+  import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
+  import { getFirestore, doc, setDoc, getDoc, onSnapshot, serverTimestamp } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js';
+  const firebaseConfig={apiKey:'AIzaSyCOYOY7bxb7Xj1wXR7t5mo4HWP6dh6ytrM',authDomain:'vish-hub.firebaseapp.com',projectId:'vish-hub',storageBucket:'vish-hub.firebasestorage.app',messagingSenderId:'287693072826',appId:'1:287693072826:web:4870d52e1eb074c1395583',measurementId:'G-E23PGJCKZT'};
+  const ADMIN_EMAIL='shrivishaljadhav@gmail.com'; const app=initializeApp(firebaseConfig); const auth=getAuth(app); const db=getFirestore(app); const sharedAdminDoc=doc(db,'vishHub','adminState');
+  window.vishHubFirebaseApp=app; window.vishHubFirebaseAuth=auth; window.vishHubAdminAuthorized=false;
+  window.vishHubSaveCloudSnapshot=async(snapshot)=>{
+    if(!window.vishHubAdminAuthorized||auth.currentUser?.email?.toLowerCase()!==ADMIN_EMAIL)throw new Error('Admin sign-in is required to publish shared content.');
+    const payload=JSON.stringify(snapshot);
+    if(new TextEncoder().encode(payload).length>800000)throw new Error('Admin content is too large for one Firestore document.');
+    await setDoc(sharedAdminDoc,{snapshot,updatedAt:serverTimestamp()});
   };
-
-  const app = initializeApp(firebaseConfig);
-  window.vishHubFirebaseApp = app;
-
-  try {
-    if (await isAnalyticsSupported()) {
-      window.vishHubAnalytics = getAnalytics(app);
-      document.documentElement.dataset.firebaseAnalytics = 'ready';
-    }
-  } catch (error) {
-    console.warn('Firebase Analytics is unavailable in this browser.', error);
-    document.documentElement.dataset.firebaseAnalytics = 'unavailable';
-  }
+  onSnapshot(sharedAdminDoc,(remote)=>{
+    if(remote.exists()&&remote.data()?.snapshot){window.dispatchEvent(new CustomEvent('vishhub-cloud-snapshot',{detail:remote.data().snapshot}));}
+  },error=>{console.error('Firebase shared-content listener failed.',error);window.dispatchEvent(new CustomEvent('vishhub-cloud-error',{detail:error}));});
+  window.vishHubEnsureCloudSnapshot=async()=>{
+    try{const remote=await getDoc(sharedAdminDoc);if(!remote.exists())window.dispatchEvent(new Event('vishhub-cloud-empty'));}
+    catch(error){console.error('Could not check shared Admin content in Firestore.',error);}
+  };
+  try{if(await isAnalyticsSupported()){window.vishHubAnalytics=getAnalytics(app);document.documentElement.dataset.firebaseAnalytics='ready'}}catch(error){console.warn('Firebase Analytics is unavailable in this browser.',error);document.documentElement.dataset.firebaseAnalytics='unavailable'}
+  const adminPath=()=>location.pathname.replace(/\/+$/,'')==='/vishadmin'; const gate=document.getElementById('adminAuthGate'); const panel=document.getElementById('adminPanelPage'); const form=document.getElementById('adminAuthForm'); const status=document.getElementById('adminAuthStatus'); const setStatus=(message)=>{if(status)status.textContent=message};
+  const authorize=async(user)=>{
+    if(!user||user.email?.toLowerCase()!==ADMIN_EMAIL){window.vishHubAdminAuthorized=false;if(panel)panel.hidden=true;if(gate&&adminPath())gate.hidden=false;setStatus('This Firebase account is not authorized for admin access.');if(user)await signOut(auth);return}
+    window.vishHubAdminAuthorized=true;if(gate)gate.hidden=true;setStatus('');window.vishHubEnsureCloudSnapshot?.();window.dispatchEvent(new Event('vishhub-admin-authorized'))
+  };
+  if(adminPath()){if(panel)panel.hidden=true;if(gate)gate.hidden=false;form?.addEventListener('submit',async(event)=>{event.preventDefault();const submit=document.getElementById('adminAuthSubmit');if(submit)submit.disabled=true;setStatus('Signing in…');try{const email=document.getElementById('adminAuthEmail')?.value?.trim().toLowerCase()||'';const password=document.getElementById('adminAuthPassword')?.value||'';if(email!==ADMIN_EMAIL)throw new Error('Use the authorized admin email address.');const credential=await signInWithEmailAndPassword(auth,email,password);await authorize(credential.user);if(window.vishHubAdminAuthorized)form.reset()}catch(error){setStatus(error?.code==='auth/invalid-credential'||error?.code==='auth/wrong-password'?'Email or password is incorrect.':error?.message||'Sign-in failed. Please try again.')}finally{if(submit)submit.disabled=false}});onAuthStateChanged(auth,(user)=>{if(user)authorize(user);else{window.vishHubAdminAuthorized=false;if(panel)panel.hidden=true;if(gate)gate.hidden=false}});document.getElementById('adminSignOutBtn')?.addEventListener('click',()=>signOut(auth))}
 </script>
 </body>
 </html>

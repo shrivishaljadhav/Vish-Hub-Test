@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/vishadmin", "destination": "/vish_hub_fyba_academic_hub.html" },
+    { "source": "/vishadmin/", "destination": "/vish_hub_fyba_academic_hub.html" }
+  ]
+}
